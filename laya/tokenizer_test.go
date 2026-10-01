@@ -8,7 +8,14 @@ import (
 	"testing"
 )
 
-const modelDir = "../models/laya" // large files, downloaded separately; tests skip without them
+// Large files, downloaded separately; tests skip without them. LAYA_TEST_MODEL_DIR / LAYA_TEST_REF_DIR
+// (and LAYA_GGUF) point the whole suite at another checkpoint, e.g. the English ModernBERT one:
+//
+//	LAYA_TEST_MODEL_DIR=../models/laya-en LAYA_TEST_REF_DIR=testdata/en LAYA_GGUF=laya-en-F16.gguf go test ./laya
+var (
+	modelDir = envOr("LAYA_TEST_MODEL_DIR", "../models/laya")
+	refDir   = envOr("LAYA_TEST_REF_DIR", "testdata")
+)
 
 var (
 	tokOnce sync.Once
@@ -20,7 +27,7 @@ var (
 func testTokenizer(t *testing.T) *Tokenizer {
 	t.Helper()
 	if _, err := os.Stat(modelDir + "/tokenizer.json"); err != nil {
-		t.Skip("models/laya/tokenizer.json not downloaded")
+		t.Skip(modelDir, "/tokenizer.json not downloaded")
 	}
 	tokOnce.Do(func() { tokInst, tokErr = LoadTokenizer(modelDir + "/tokenizer.json") })
 	if tokErr != nil {
@@ -32,7 +39,7 @@ func testTokenizer(t *testing.T) *Tokenizer {
 func TestTokenizerMatchesHF(t *testing.T) {
 	tok := testTokenizer(t)
 
-	raw, err := os.ReadFile("testdata/tokenizer_ref.json")
+	raw, err := os.ReadFile(refDir + "/tokenizer_ref.json")
 	if err != nil {
 		t.Skip("run laya/testdata/gen_ref.py first")
 	}

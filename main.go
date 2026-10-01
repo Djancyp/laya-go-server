@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,19 +31,30 @@ func main() {
 	}
 }
 
+// defaultModel is the embedded model (a dir under assets/) that runs when LAYA_MODEL is unset.
+const defaultModel = "laya-guard"
+
+// defaultGGUF is the only *.gguf in dir (so a model dir needs no LAYA_GGUF), else the stock file name.
+func defaultGGUF(dir string) string {
+	if m, _ := filepath.Glob(filepath.Join(dir, "*.gguf")); len(m) == 1 {
+		return filepath.Base(m[0])
+	}
+	return "laya-multilingual-F16.gguf"
+}
+
 func run(log *slog.Logger) error {
 	// Default to the embedded libs and model; LAYA_LLAMA_LIB / LAYA_DIR use external files instead.
 	libDir, dir := os.Getenv("LAYA_LLAMA_LIB"), os.Getenv("LAYA_DIR")
 	if libDir == "" || dir == "" {
 		start := time.Now()
-		embLib, embDir, err := extractAssets(assets)
+		embLib, embDir, err := extractAssets(assets, env("LAYA_MODEL", defaultModel))
 		if err != nil {
 			return fmt.Errorf("extract embedded assets: %w", err)
 		}
 		log.Info("embedded assets ready", "ms", time.Since(start).Milliseconds())
 		libDir, dir = cmp.Or(libDir, embLib), cmp.Or(dir, embDir)
 	}
-	gguf := env("LAYA_GGUF", "laya-multilingual-F16.gguf")
+	gguf := cmp.Or(os.Getenv("LAYA_GGUF"), defaultGGUF(dir))
 
 	s := &server{
 		log:     log,

@@ -60,7 +60,7 @@ var (
 func loadRef(t *testing.T) {
 	t.Helper()
 	refOnce.Do(func() {
-		raw, err := os.ReadFile("testdata/predict_ref.json")
+		raw, err := os.ReadFile(refDir + "/predict_ref.json")
 		if err != nil {
 			refErr = err
 			return
@@ -75,7 +75,7 @@ func loadRef(t *testing.T) {
 func testHead(t *testing.T) (*Head, *HeadConfig) {
 	t.Helper()
 	if _, err := os.Stat(modelDir + "/laya-multilingual-head.safetensors"); err != nil {
-		t.Skip("models/laya head not downloaded")
+		t.Skip(modelDir, " head not downloaded")
 	}
 	h, cfg, err := LoadHead(modelDir + "/laya-multilingual-head.safetensors")
 	if err != nil {
@@ -110,7 +110,8 @@ func TestHeadMatchesPyTorch(t *testing.T) {
 
 func TestHeadRejectsBadInput(t *testing.T) {
 	h, _ := testHead(t)
-	good := make([]float32, 4*hiddenDim)
+	dim := h.Dim()
+	good := make([]float32, 4*dim)
 
 	tests := []struct {
 		name    string
@@ -119,7 +120,7 @@ func TestHeadRejectsBadInput(t *testing.T) {
 		markers []int
 	}{
 		{"empty hidden", nil, 0, []int{0}},
-		{"ragged hidden", make([]float32, hiddenDim+1), 0, []int{0}},
+		{"ragged hidden", make([]float32, dim+1), 0, []int{0}},
 		{"bad qtype", good, 3, []int{0}},
 		{"negative qtype", good, -1, []int{0}},
 		{"marker past the end", good, 0, []int{4}},
@@ -168,7 +169,7 @@ func TestLinearMatchesReference(t *testing.T) {
 func TestLogitsScratchReuse(t *testing.T) {
 	h, _ := testHead(t)
 	in := func(n int, seed float32) []float32 {
-		x := make([]float32, n*hiddenDim)
+		x := make([]float32, n*h.Dim())
 		for i := range x {
 			x[i] = float32(math.Sin(float64(seed) + float64(i)*0.001))
 		}

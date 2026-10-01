@@ -24,8 +24,16 @@ var soFile = regexp.MustCompile(`^(lib.+\.so)\.(\d+)\.\d+\.\d+$`)
 
 // extractAssets writes the embedded files under LAYA_CACHE_DIR (default: the user cache dir),
 // in a directory named after the embedded content, and returns the lib and model dirs.
-// Files already there with the right size are kept, so restarts are instant.
-func extractAssets(src fs.FS) (libDir, modelDir string, err error) {
+// Only the libs and the selected model (a directory under assets/, e.g. "laya" or "laya-guard") are
+// written; the other embedded models stay in the binary. Files already there with the right size
+// are kept, so restarts are instant.
+func extractAssets(src fs.FS, model string) (libDir, modelDir string, err error) {
+	if model == "" || model != filepath.Base(model) || model == "." || model == ".." || model == libAssetsDir {
+		return "", "", fmt.Errorf("invalid LAYA_MODEL %q (embedded models: %s)", model, strings.Join(embeddedModels(src), ", "))
+	}
+	if !slicesContains(embeddedModels(src), model) {
+		return "", "", fmt.Errorf("unknown LAYA_MODEL %q (embedded models: %s)", model, strings.Join(embeddedModels(src), ", "))
+	}
 	root := os.Getenv("LAYA_CACHE_DIR")
 	if root == "" {
 		base, err := os.UserCacheDir()
@@ -44,7 +52,11 @@ func extractAssets(src fs.FS) (libDir, modelDir string, err error) {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		return extractFile(src, p, filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(p, "assets/"))))
+		rel := strings.TrimPrefix(p, "assets/")
+		if !strings.HasPrefix(rel, libAssetsDir+"/") && !strings.HasPrefix(rel, model+"/") {
+			return nil // a model that was not selected
+		}
+		return extractFile(src, p, filepath.Join(root, filepath.FromSlash(rel)))
 	})
 	if err != nil {
 		return "", "", err
@@ -70,7 +82,28 @@ func extractAssets(src fs.FS) (libDir, modelDir string, err error) {
 			}
 		}
 	}
-	return libDir, filepath.Join(root, "laya"), nil
+	return libDir, filepath.Join(root, model), nil
+}
+
+// embeddedModels lists the model directories under assets/ (everything except the libs).
+func embeddedModels(src fs.FS) []string {
+	entries, _ := fs.ReadDir(src, "assets")
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), libAssetsDir) && e.Name() != "llama" && e.Name() != "llama-cuda" {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func slicesContains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // assetsID names the cache dir after the embedded file names, sizes and the first and last

@@ -14,6 +14,9 @@ COPY --from=build /laya-server /usr/local/bin/laya-server
 USER laya
 # Libs and model are embedded; they are extracted to LAYA_CACHE_DIR on start (mount a volume to keep it).
 # Probes: GET /healthz (liveness), GET /readyz (model loaded).
-ENV LAYA_CACHE_DIR=/var/cache/laya LAYA_ADDR=:8080
+# Which embedded model runs by default: laya-guard (prompt-injection guard) or laya (stock multilingual).
+# Override at run time with -e LAYA_MODEL=..., or at build time: --build-arg DEFAULT_MODEL=laya.
+ARG DEFAULT_MODEL=laya-guard
+ENV LAYA_MODEL=$DEFAULT_MODEL LAYA_CACHE_DIR=/var/cache/laya LAYA_ADDR=:8080
 EXPOSE 8080
 ENTRYPOINT ["laya-server"]

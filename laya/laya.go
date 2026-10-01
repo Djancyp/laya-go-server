@@ -113,6 +113,11 @@ func Open(o Options) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	if enc.Dim() != head.Dim() {
+		enc.Close()
+		return nil, fmt.Errorf("laya: encoder %s has hidden size %d but the head expects %d: the GGUF and head files are from different models",
+			o.GGUF, enc.Dim(), head.Dim())
+	}
 	return &Model{tok: tok, enc: enc, head: head, cfg: *cfg}, nil
 }
 
@@ -126,7 +131,7 @@ func (m *Model) Predict(state string, questions []Question) ([]Result, error) {
 		return nil, errors.New("laya: no questions")
 	}
 
-	stateIDs := m.tok.Encode(strings.ReplaceAll(state, maskText, " "))
+	stateIDs := m.tok.Encode(strings.ReplaceAll(state, m.tok.MaskText, " "))
 	results := make([]Result, len(questions))
 	errs := make([]error, len(questions))
 
@@ -180,8 +185,6 @@ func (m *Model) predictOne(q Question, stateIDs []int32) (Result, error) {
 	return r, nil
 }
 
-const maskText = "<mask>" // must not appear in user text: the tokenizer would treat it as a token
-
 // renderOptions is the text shown for each option (Python laya render_options).
 func renderOptions(q Question) ([]string, error) {
 	switch q.Kind {
@@ -230,13 +233,13 @@ func (m *Model) buildSequence(q Question, stateIDs []int32) (ids []int32, marker
 	}
 	maxLen, headMax := m.cfg.MaxLen, m.cfg.HeadMaxLen
 
-	ins := strings.ReplaceAll(q.Instructions, maskText, " ")
+	ins := strings.ReplaceAll(q.Instructions, m.tok.MaskText, " ")
 	headIDs := m.tok.Encode(fmt.Sprintf("%s question: %s", q.Kind, ins))
 
 	optIDs := make([][]int32, len(opts))
 	total := 0
 	for i, o := range opts {
-		toks := m.tok.Encode(" " + strings.ReplaceAll(o, maskText, " "))
+		toks := m.tok.Encode(" " + strings.ReplaceAll(o, m.tok.MaskText, " "))
 		toks = toks[:min(len(toks), 48)]
 		optIDs[i] = append([]int32{m.tok.Mask}, toks...)
 		total += len(optIDs[i])
