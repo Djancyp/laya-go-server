@@ -1,0 +1,21 @@
+# Live reload: `make dev` (air is pinned as a go.mod tool, no global install needed).
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "GOEXPERIMENT=simd go build -o ./tmp/laya-server ."
+  entrypoint = ["./tmp/laya-server"]
+  include_ext = ["go"]
+  exclude_dir = ["tmp", "assets", "models", "testdata", ".git"]
+  exclude_regex = ["_test\\.go$"]
+  # SIGINT lets the server drain in-flight predictions (it waits up to 30s) before the model is freed.
+  send_interrupt = true
+  kill_delay = "5s"
+  # A failed build keeps the previous binary running.
+  stop_on_error = false
+
+[log]
+  time = false
+
+[misc]
+  clean_on_exit = true

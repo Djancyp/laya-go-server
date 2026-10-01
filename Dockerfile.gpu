@@ -1,0 +1,38 @@
+# CUDA build. llama.cpp is compiled here (CUDA 12.6, native code for sm_70 V100 through sm_90 H100) because the
+# official CUDA 12.8 release only ships PTX for V100, which a CUDA 12.6 driver cannot JIT.
+# Needs assets/laya (`make assets`). Build: make docker-build-gpu
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS llama
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG LLAMA_TAG=b11017
+# Parallel compile jobs: nvcc runs several GPU-arch passes per job, so keep this well below the core count.
+ARG JOBS=6
+RUN git clone --depth 1 --branch ${LLAMA_TAG} https://github.com/ggml-org/llama.cpp /llama.cpp
+WORKDIR /llama.cpp
+# Same layout as the official releases: dynamic backends (CPU variants + CUDA) next to libllama.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+      -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89-real;90" \
+      -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+    && cmake --build build -j${JOBS} \
+    && mkdir /out && cp -L build/bin/lib*.so* /out/ && ls -l /out
+
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# Real versioned files only: the server recreates the SONAME symlinks when it extracts them.
+COPY --from=llama /out/ /tmp/llama-libs/
+RUN mkdir -p assets/llama-cuda && cd /tmp/llama-libs && for f in lib*.so*; do [ -L "$f" ] || cp "$f" /src/assets/llama-cuda/; done
+RUN CGO_ENABLED=0 GOEXPERIMENT=simd go build -tags cuda -trimpath -ldflags="-s -w" -o /laya-server .
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 laya && mkdir /var/cache/laya && chown laya /var/cache/laya
+COPY --from=build /laya-server /usr/local/bin/laya-server
+USER laya
+ENV LAYA_CACHE_DIR=/var/cache/laya LAYA_ADDR=:8080 LAYA_GPU_LAYERS=99 NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+EXPOSE 8080
+ENTRYPOINT ["laya-server"]

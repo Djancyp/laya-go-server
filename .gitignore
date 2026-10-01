@@ -1,0 +1,15 @@
+# built binary and air's build dir
+/laya-server
+tmp/
+
+# model weights and llama.cpp libs: large, copied in by `make assets`
+assets/
+/models
+*.gguf
+*.safetensors
+
+# go test / pprof output
+*.test
+*.prof
+
+.env
