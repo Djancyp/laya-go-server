@@ -1,6 +1,6 @@
 # CUDA build. llama.cpp is compiled here (CUDA 12.6, native code for sm_70 V100 through sm_90 H100) because the
 # official CUDA 12.8 release only ships PTX for V100, which a CUDA 12.6 driver cannot JIT.
-# Needs assets/laya (`make assets`). Build: make docker-build-gpu
+# Needs assets/laya and assets/laya-guard (`make assets`). Build: make docker-build-gpu
 FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS llama
 RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && useradd -r -u 10001 laya && mkdir /var/cache/laya && chown laya /var/cache/laya
 COPY --from=build /laya-server /usr/local/bin/laya-server
 USER laya
-ENV LAYA_CACHE_DIR=/var/cache/laya LAYA_ADDR=:8080 LAYA_GPU_LAYERS=99 NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ARG DEFAULT_MODEL=laya-guard
+ENV LAYA_MODEL=$DEFAULT_MODEL LAYA_CACHE_DIR=/var/cache/laya LAYA_ADDR=:8080 LAYA_GPU_LAYERS=99 NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EXPOSE 8080
 ENTRYPOINT ["laya-server"]

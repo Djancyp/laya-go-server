@@ -7,7 +7,7 @@ import (
 	"github.com/hybridgroup/yzma/pkg/llama"
 )
 
-// Encoder runs the mmBERT encoder from a GGUF through llama.cpp and returns the
+// Encoder runs the encoder (mmBERT or ModernBERT) from a GGUF through llama.cpp and returns the
 // per-token last_hidden_state (pooling disabled), which the Head consumes.
 //
 // llama.cpp must already be loaded and initialised (llama.Load + llama.Init; in the chat app
@@ -50,10 +50,6 @@ func NewEncoder(path string, maxTokens, gpuLayers, contexts, threads int) (*Enco
 	}
 
 	dim := int(llama.ModelNEmbd(model))
-	if dim != hiddenDim {
-		llama.ModelFree(model)
-		return nil, fmt.Errorf("laya: model embedding size is %d, want %d", dim, hiddenDim)
-	}
 
 	// An encoder-only model needs the whole sequence in one micro-batch and every token's
 	// output, so: pooling none, embeddings on, ubatch >= sequence length.
@@ -81,10 +77,13 @@ func NewEncoder(path string, maxTokens, gpuLayers, contexts, threads int) (*Enco
 	return e, nil
 }
 
+// Dim is the hidden size of the encoder output.
+func (e *Encoder) Dim() int { return e.dim }
+
 // Contexts is how many sequences can be encoded at once.
 func (e *Encoder) Contexts() int { return e.n }
 
-// Hidden returns the encoder output for ids: len(ids) x 768 floats, row-major.
+// Hidden returns the encoder output for ids: len(ids) x Dim() floats, row-major.
 func (e *Encoder) Hidden(ids []int32) ([]float32, error) {
 	n := len(ids)
 	if n == 0 || n > e.maxTokens {

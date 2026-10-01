@@ -75,6 +75,10 @@ func refQuestions(t *testing.T, raw map[string]json.RawMessage, only map[string]
 			}
 		case "noul":
 			q.Kind = Noul
+			if len(def.Criteria) > 0 && string(def.Criteria) != "null" { // optional {"false": ..., "true": ...}
+				_, vals := orderedKeys(t, def.Criteria)
+				q.Options = []Option{{Label: "false", Description: str(vals["false"])}, {Label: "true", Description: str(vals["true"])}}
+			}
 		}
 		qs = append(qs, q)
 	}
@@ -104,7 +108,7 @@ func TestBuildSequenceMatchesPython(t *testing.T) {
 		if !ok {
 			continue
 		}
-		stateIDs := tok.Encode(strings.ReplaceAll(state, maskText, " "))
+		stateIDs := tok.Encode(strings.ReplaceAll(state, tok.MaskText, " "))
 
 		for _, q := range refQuestions(t, c.Questions, c.PerQuestion) {
 			t.Run(q.ID+"/case"+string(rune('a'+ci)), func(t *testing.T) {

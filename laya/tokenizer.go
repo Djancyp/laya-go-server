@@ -11,11 +11,15 @@ import (
 	"unicode/utf8"
 )
 
-// Tokenizer is a Go port of the HF `tokenizers` pipeline used by Laya's Gemma-style
-// tokenizer.json: added-token splitting -> Replace(" ","▁") -> Metaspace(prepend always,
-// split) -> BPE with byte fallback. It only does what this checkpoint needs.
-// ponytail: supports exactly this tokenizer.json layout (BPE + Metaspace + Replace), not the
-// general HF format.
+// Tokenizer is a Go port of the HF `tokenizers` pipeline used by Laya's tokenizer.json files.
+// Two layouts are supported, picked from the file:
+//
+//   - Gemma-style (mmBERT): added-token splitting -> Replace(" ","▁") -> Metaspace(prepend always,
+//     split) -> BPE with byte fallback.
+//   - GPT-2-style (ModernBERT): added-token splitting -> NFC -> ByteLevel(regex split, no prefix
+//     space) -> BPE over the byte-to-unicode alphabet.
+//
+// ponytail: only these two layouts, not the general HF format.
 type Tokenizer struct {
 	vocab    map[string]int32
 	ranks    map[[2]string]int32
@@ -25,8 +29,13 @@ type Tokenizer struct {
 	mu       sync.Mutex         // guards cache
 	cache    map[string][]int32 // BPE result per pre-token
 
+	byteLevel bool // GPT-2-style ByteLevel pre-tokenizer instead of Metaspace
+
 	// Special token ids used to build sequences.
 	CLS, SEP, Mask, Pad int32
+	// MaskText is the mask token's text. It must not appear in user text (the tokenizer would
+	// turn it into the mask token), so callers replace it with a space first.
+	MaskText string
 }
 
 type addedToken struct {
@@ -59,7 +68,7 @@ func LoadTokenizer(path string) (*Tokenizer, error) {
 			Type         string            `json:"type"`
 			Vocab        map[string]int32  `json:"vocab"`
 			Merges       []json.RawMessage `json:"merges"`
-			Unk          string            `json:"unk_token"`
+			Unk          *string           `json:"unk_token"`
 			ByteFallback bool              `json:"byte_fallback"`
 			IgnoreMerges bool              `json:"ignore_merges"`
 			Dropout      *float64          `json:"dropout"`
@@ -69,17 +78,30 @@ func LoadTokenizer(path string) (*Tokenizer, error) {
 			Content string `json:"content"`
 		} `json:"normalizer"`
 		PreTokenizer struct {
-			Type          string `json:"type"`
-			Replacement   string `json:"replacement"`
-			PrependScheme string `json:"prepend_scheme"`
-			Split         bool   `json:"split"`
+			Type           string `json:"type"`
+			Replacement    string `json:"replacement"`
+			PrependScheme  string `json:"prepend_scheme"`
+			Split          bool   `json:"split"`
+			AddPrefixSpace bool   `json:"add_prefix_space"`
+			UseRegex       bool   `json:"use_regex"`
 		} `json:"pre_tokenizer"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("laya: parse tokenizer: %w", err)
 	}
 
+	byteLevel := f.PreTokenizer.Type == "ByteLevel"
 	switch {
+	case byteLevel:
+		if f.Model.Type != "BPE" || f.Model.ByteFallback || f.Model.IgnoreMerges || f.Model.Dropout != nil {
+			return nil, fmt.Errorf("laya: unsupported tokenizer model (need plain BPE without byte_fallback)")
+		}
+		if f.Normalizer.Type != "" && f.Normalizer.Type != "NFC" {
+			return nil, fmt.Errorf("laya: unsupported normalizer %q (need NFC or none)", f.Normalizer.Type)
+		}
+		if f.PreTokenizer.AddPrefixSpace || !f.PreTokenizer.UseRegex {
+			return nil, fmt.Errorf("laya: unsupported ByteLevel pre_tokenizer (need use_regex, no prefix space)")
+		}
 	case f.Model.Type != "BPE" || !f.Model.ByteFallback || f.Model.IgnoreMerges || f.Model.Dropout != nil:
 		return nil, fmt.Errorf("laya: unsupported tokenizer model (need plain BPE with byte_fallback)")
 	case f.Normalizer.Type != "Replace" || f.Normalizer.Content != metaspace:
@@ -90,9 +112,10 @@ func LoadTokenizer(path string) (*Tokenizer, error) {
 	}
 
 	t := &Tokenizer{
-		vocab: f.Model.Vocab,
-		ranks: make(map[[2]string]int32, len(f.Model.Merges)),
-		cache: map[string][]int32{},
+		vocab:     f.Model.Vocab,
+		ranks:     make(map[[2]string]int32, len(f.Model.Merges)),
+		cache:     map[string][]int32{},
+		byteLevel: byteLevel,
 	}
 	for i, m := range f.Model.Merges {
 		var pair [2]string
@@ -111,9 +134,14 @@ func LoadTokenizer(path string) (*Tokenizer, error) {
 		t.ranks[pair] = int32(i)
 	}
 
-	var ok bool
-	if t.unk, ok = t.vocab[f.Model.Unk]; !ok {
-		return nil, fmt.Errorf("laya: unk token %q not in vocab", f.Model.Unk)
+	t.unk = -1 // ByteLevel BPE has no unk: every byte is in the alphabet
+	if f.Model.Unk != nil {
+		var ok bool
+		if t.unk, ok = t.vocab[*f.Model.Unk]; !ok {
+			return nil, fmt.Errorf("laya: unk token %q not in vocab", *f.Model.Unk)
+		}
+	} else if !byteLevel {
+		return nil, fmt.Errorf("laya: tokenizer has no unk_token")
 	}
 
 	t.trieRoot = &trieNode{next: map[byte]*trieNode{}, tok: -1}
@@ -130,8 +158,21 @@ func LoadTokenizer(path string) (*Tokenizer, error) {
 		n.tok = len(t.added) - 1
 	}
 
-	for name, dst := range map[string]*int32{"<bos>": &t.CLS, "<eos>": &t.SEP, "<mask>": &t.Mask, "<pad>": &t.Pad} {
+	names := map[string]*int32{"<bos>": &t.CLS, "<eos>": &t.SEP, "<mask>": &t.Mask, "<pad>": &t.Pad}
+	t.MaskText = "<mask>"
+	if byteLevel {
+		names = map[string]*int32{"[CLS]": &t.CLS, "[SEP]": &t.SEP, "[MASK]": &t.Mask, "[PAD]": &t.Pad}
+		t.MaskText = "[MASK]"
+	}
+	for name, dst := range names {
 		id, ok := t.vocab[name]
+		if !ok { // ModernBERT's special tokens live in added_tokens, not the vocab
+			for _, a := range t.added {
+				if a.content == name {
+					id, ok = a.id, true
+				}
+			}
+		}
 		if !ok {
 			return nil, fmt.Errorf("laya: special token %s missing", name)
 		}
@@ -202,8 +243,11 @@ func isSpace(r rune) bool {
 	return r >= 0x2000 && r <= 0x200A
 }
 
-// encodePlain runs normalizer, Metaspace pre-tokenizer and BPE on text without added tokens.
+// encodePlain runs normalizer, pre-tokenizer and BPE on text without added tokens.
 func (t *Tokenizer) encodePlain(text string) []int32 {
+	if t.byteLevel {
+		return t.encodeByteLevel(text)
+	}
 	text = strings.ReplaceAll(text, " ", metaspace)
 	if !strings.HasPrefix(text, metaspace) { // prepend_scheme=always
 		text = metaspace + text

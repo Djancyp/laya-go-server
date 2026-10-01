@@ -46,8 +46,8 @@ type HeadConfig struct {
 }
 
 const (
-	hiddenDim = 768
-	headDim   = 64 // PyTorch nhead = d/64
+	hiddenDim = 768 // mmBERT-base; only the tests' default, the head reads its width from type_emb.weight
+	headDim   = 64  // PyTorch nhead = d/64
 	lnEps     = 1e-5
 )
 
@@ -66,7 +66,12 @@ func LoadHead(path string) (*Head, *HeadConfig, error) {
 		return nil, nil, fmt.Errorf("laya: unsupported head_layers=%d", cfg.HeadLayers)
 	}
 
-	d := hiddenDim
+	// The width comes from the file (768 for mmBERT-base, 1024 for ModernBERT-large).
+	shape, ok := t.Shape("type_emb.weight")
+	if !ok || len(shape) != 2 || shape[0] != 3 || shape[1] < headDim || shape[1]%headDim != 0 {
+		return nil, nil, fmt.Errorf("laya: type_emb.weight has shape %v, want [3 d] with d a multiple of %d", shape, headDim)
+	}
+	d := shape[1]
 	h := &Head{d: d, heads: d / headDim, ff: 4 * d}
 
 	var firstErr error
@@ -101,8 +106,11 @@ func LoadHead(path string) (*Head, *HeadConfig, error) {
 	return h, &cfg, nil
 }
 
+// Dim is the encoder hidden size the head expects.
+func (h *Head) Dim() int { return h.d }
+
 // Logits scores every option marker. hidden is the encoder's last_hidden_state for one
-// sequence (n x 768, row-major); qtype is 0 choice / 1 score / 2 noul; markers are the
+// sequence (n x Dim(), row-major); qtype is 0 choice / 1 score / 2 noul; markers are the
 // token positions of each option's [MASK]. It returns one logit per marker.
 func (h *Head) Logits(hidden []float32, qtype int, markers []int) ([]float32, error) {
 	d := h.d

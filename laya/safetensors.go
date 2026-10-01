@@ -91,6 +91,12 @@ func (t *Tensors) Get(name string, shape ...int) ([]float32, error) {
 	return x.data, nil
 }
 
+// Shape returns a tensor's shape, or false when the tensor is absent.
+func (t *Tensors) Shape(name string) ([]int, bool) {
+	v, ok := t.data[name]
+	return v.shape, ok
+}
+
 func decode(dtype string, b []byte) ([]float32, error) {
 	switch dtype {
 	case "F32":

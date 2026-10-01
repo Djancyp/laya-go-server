@@ -20,7 +20,7 @@ func testEncoder(t *testing.T) *Encoder {
 	t.Helper()
 	gguf := modelDir + "/" + envOr("LAYA_GGUF", "laya-multilingual-F16.gguf")
 	if _, err := os.Stat(gguf); err != nil {
-		t.Skip("models/laya GGUF not downloaded")
+		t.Skip(gguf, " not downloaded")
 	}
 	lib := os.Getenv("LAYA_LLAMA_LIB")
 	if lib == "" {
