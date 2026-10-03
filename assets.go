@@ -22,38 +22,55 @@ import (
 // so the SONAME (libllama.so.0) and dev (libllama.so) links the loader asks for are recreated.
 var soFile = regexp.MustCompile(`^(lib.+\.so)\.(\d+)\.\d+\.\d+$`)
 
+// modelLibs maps a model to the lib dir it needs when that is not the default one: GLiNER2.5-Decide is
+// a DeBERTa-v2 encoder, which only the patched llama.cpp build (assets/llama-deberta) can load. Where
+// the patched libs are not embedded (the CUDA build) the default libs are used and that model fails to load.
+var modelLibs = map[string]string{"gliner2-decide": "llama-deberta"}
+
+// libDirFor is the embedded lib dir (under assets/) the model runs on.
+func libDirFor(src fs.FS, model string) string {
+	if d, ok := modelLibs[model]; ok {
+		if st, err := fs.Stat(src, path.Join("assets", d)); err == nil && st.IsDir() {
+			return d
+		}
+	}
+	return libAssetsDir
+}
+
 // extractAssets writes the embedded files under LAYA_CACHE_DIR (default: the user cache dir),
 // in a directory named after the embedded content, and returns the lib and model dirs.
-// Only the libs and the selected model (a directory under assets/, e.g. "laya" or "laya-guard") are
+// Only the libs the model runs on and the selected model (a directory under assets/, e.g. "laya" or "laya-guard") are
 // written; the other embedded models stay in the binary. Files already there with the right size
 // are kept, so restarts are instant.
 func extractAssets(src fs.FS, model string) (libDir, modelDir string, err error) {
-	if model == "" || model != filepath.Base(model) || model == "." || model == ".." || model == libAssetsDir {
+	if model == "" || model != filepath.Base(model) || model == "." || model == ".." || strings.HasPrefix(model, "llama") {
 		return "", "", fmt.Errorf("invalid LAYA_MODEL %q (embedded models: %s)", model, strings.Join(embeddedModels(src), ", "))
 	}
-	if !slicesContains(embeddedModels(src), model) {
-		return "", "", fmt.Errorf("unknown LAYA_MODEL %q (embedded models: %s)", model, strings.Join(embeddedModels(src), ", "))
+	_, remote := remoteModels[model]
+	if remote && model == policyModelName {
+		remote = false // the policy chat model is not selectable as the classifier
 	}
-	root := os.Getenv("LAYA_CACHE_DIR")
-	if root == "" {
-		base, err := os.UserCacheDir()
-		if err != nil {
-			return "", "", fmt.Errorf("no cache dir: %w (set LAYA_CACHE_DIR)", err)
-		}
-		root = filepath.Join(base, "laya-server")
+	if !remote && !slicesContains(embeddedModels(src), model) {
+		return "", "", fmt.Errorf("unknown LAYA_MODEL %q (embedded models: %s; downloaded on first use: %s)", model,
+			strings.Join(embeddedModels(src), ", "), strings.Join(selectableRemote(), ", "))
+	}
+	root, err := cacheRoot()
+	if err != nil {
+		return "", "", err
 	}
 	id, err := assetsID(src)
 	if err != nil {
 		return "", "", err
 	}
 	root = filepath.Join(root, id)
+	libName := libDirFor(src, model)
 
 	err = fs.WalkDir(src, "assets", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
 		rel := strings.TrimPrefix(p, "assets/")
-		if !strings.HasPrefix(rel, libAssetsDir+"/") && !strings.HasPrefix(rel, model+"/") {
+		if !strings.HasPrefix(rel, libName+"/") && (remote || !strings.HasPrefix(rel, model+"/")) {
 			return nil // a model that was not selected
 		}
 		return extractFile(src, p, filepath.Join(root, filepath.FromSlash(rel)))
@@ -62,7 +79,7 @@ func extractAssets(src fs.FS, model string) (libDir, modelDir string, err error)
 		return "", "", err
 	}
 
-	libDir = filepath.Join(root, libAssetsDir)
+	libDir = filepath.Join(root, libName)
 	entries, err := os.ReadDir(libDir)
 	if err != nil {
 		return "", "", err
@@ -82,7 +99,25 @@ func extractAssets(src fs.FS, model string) (libDir, modelDir string, err error)
 			}
 		}
 	}
+	if remote { // the caller downloads the model into this dir (see ensureRemote)
+		dir, err := remoteDir(model)
+		return libDir, dir, err
+	}
 	return libDir, filepath.Join(root, model), nil
+}
+
+// policyModelName is the remoteModels entry for the policy chat model.
+const policyModelName = "policy"
+
+// selectableRemote lists the downloadable models LAYA_MODEL accepts.
+func selectableRemote() []string {
+	var out []string
+	for name := range remoteModels {
+		if name != policyModelName {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // embeddedModels lists the model directories under assets/ (everything except the libs).
@@ -90,7 +125,7 @@ func embeddedModels(src fs.FS) []string {
 	entries, _ := fs.ReadDir(src, "assets")
 	var out []string
 	for _, e := range entries {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), libAssetsDir) && e.Name() != "llama" && e.Name() != "llama-cuda" {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), "llama") {
 			out = append(out, e.Name())
 		}
 	}

@@ -30,7 +30,7 @@ func BenchmarkParse(b *testing.B) {
 		b.Run(fmt.Sprintf("questions=%d", n), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, _, err := r.parse(l); err != nil {
+				if _, _, err := r.parse(l, false); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -41,7 +41,7 @@ func BenchmarkParse(b *testing.B) {
 func BenchmarkToAnswers(b *testing.B) {
 	for _, n := range []int{1, 16, 64} {
 		r := benchRequest(n)
-		_, qs, _ := r.parse(limits{MaxQuestions: 64, MaxStateBytes: 1 << 10, MaxInstructions: 1 << 10})
+		_, qs, _ := r.parse(limits{MaxQuestions: 64, MaxStateBytes: 1 << 10, MaxInstructions: 1 << 10}, false)
 		rs := make([]laya.Result, len(qs))
 		for i, q := range qs {
 			rs[i] = laya.Result{ID: q.ID, Kind: laya.Choice, Choice: "tech", Confidence: 0.9, Probs: []float64{0.1, 0.7, 0.1, 0.1}}

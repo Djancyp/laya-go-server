@@ -29,6 +29,9 @@ type limits struct {
 type request struct {
 	State     json.RawMessage `json:"state"`
 	Questions map[string]qDef `json:"questions"`
+	// Response is the assistant's reply to State; with a moderation model (Qwen3Guard) it switches
+	// the assessment from the prompt to the response.
+	Response json.RawMessage `json:"response"`
 }
 
 type qDef struct {
@@ -72,7 +75,8 @@ func (o *ordered) UnmarshalJSON(b []byte) error {
 }
 
 // parse validates the request and returns the state text and the questions in id order.
-func (r *request) parse(l limits) (string, []laya.Question, error) {
+// With optionalQuestions (a moderation model) a request may carry none.
+func (r *request) parse(l limits, optionalQuestions bool) (string, []laya.Question, error) {
 	state, err := stateText(r.State)
 	if err != nil {
 		return "", nil, err
@@ -80,7 +84,7 @@ func (r *request) parse(l limits) (string, []laya.Question, error) {
 	if len(state) > l.MaxStateBytes {
 		return "", nil, fmt.Errorf("state is %d bytes, max %d", len(state), l.MaxStateBytes)
 	}
-	if n := len(r.Questions); n == 0 || n > l.MaxQuestions {
+	if n := len(r.Questions); n > l.MaxQuestions || n == 0 && !optionalQuestions {
 		return "", nil, fmt.Errorf("questions: got %d, want 1..%d", n, l.MaxQuestions)
 	}
 
@@ -238,4 +242,19 @@ func toAnswers(qs []laya.Question, rs []laya.Result) (map[string]answer, usage, 
 		out[r.ID] = a
 	}
 	return out, u, nil
+}
+
+// responseText is the optional assistant response (same text rules as the state).
+func (r *request) responseText(l limits) (string, error) {
+	if isNull(r.Response) {
+		return "", nil
+	}
+	t, err := jsonText(r.Response)
+	if err != nil {
+		return "", fmt.Errorf("response: %w", err)
+	}
+	if len(t) > l.MaxStateBytes {
+		return "", fmt.Errorf("response is %d bytes, max %d", len(t), l.MaxStateBytes)
+	}
+	return t, nil
 }

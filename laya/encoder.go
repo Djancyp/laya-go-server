@@ -3,6 +3,8 @@ package laya
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/hybridgroup/yzma/pkg/llama"
 )
@@ -25,6 +27,27 @@ type Encoder struct {
 func InitLlama(libDir string) error {
 	if llama.LibPath() != "" {
 		return nil
+	}
+	// yzma's loader dlopens each lib by its own absolute path (e.g.
+	// libDir/libggml.so), which resolves fine regardless of RPATH — but that
+	// library's DT_NEEDED entries (e.g. libggml.so needing libggml-base.so.0)
+	// are resolved by SONAME, not by the path it was opened from. The stock
+	// llama.cpp build carries DT_RUNPATH=$ORIGIN, so siblings in the same
+	// extraction dir resolve on their own; the patched GLiNER build
+	// (assets/llama-deberta, from make assets-gliner) does not — it carries
+	// whatever absolute DT_RUNPATH its own build machine baked in, which
+	// doesn't exist anywhere else, so that lookup fails with "cannot open
+	// shared object file" for a SONAME that is, in fact, sitting right next
+	// to the library asking for it.
+	// LD_LIBRARY_PATH fixes both: for a DT_RUNPATH binary (what every variant
+	// here uses) the dynamic linker always tries LD_LIBRARY_PATH first, ahead
+	// of DT_RUNPATH — so this works today against the already-embedded
+	// llama-deberta binaries without needing to re-link or patchelf them.
+	libDir = strings.TrimRight(libDir, "/\\")
+	if existing := os.Getenv("LD_LIBRARY_PATH"); existing != "" {
+		os.Setenv("LD_LIBRARY_PATH", libDir+":"+existing)
+	} else {
+		os.Setenv("LD_LIBRARY_PATH", libDir)
 	}
 	if err := llama.Load(libDir); err != nil {
 		return fmt.Errorf("laya: load llama.cpp from %s: %w", libDir, err)

@@ -86,6 +86,7 @@ type Options struct {
 	GPULayers int    // encoder layers offloaded to the GPU (0 = CPU)
 	Threads   int    // CPU threads per encoder context (0 = GOMAXPROCS / Contexts)
 	Contexts  int    // encoder contexts, i.e. questions encoded in parallel (0 = 1)
+	MaxTokens int    // GLiNER2 only: encoder input limit in tokens (0 = 1024)
 }
 
 // Open loads the tokenizer, head and encoder. llama.cpp must be initialised first
@@ -287,9 +288,12 @@ func (m *Model) buildSequence(q Question, stateIDs []int32) (ids []int32, marker
 
 // decode turns logits into a Result (temperature scaling, softmax, typed answer).
 func (m *Model) decode(q Question, logits []float32) Result {
-	k := len(logits)
-	t := m.temperature(q.Kind, k)
+	return decodeLogits(q, logits, m.temperature(q.Kind, len(logits)))
+}
 
+// decodeLogits is decode with an explicit temperature.
+func decodeLogits(q Question, logits []float32, t float64) Result {
+	k := len(logits)
 	p := make([]float64, k)
 	maxZ := math.Inf(-1)
 	for _, l := range logits {

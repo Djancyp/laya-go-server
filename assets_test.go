@@ -53,3 +53,38 @@ func TestExtractAssets(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractAssetsLibsAndRemote(t *testing.T) {
+	t.Setenv("LAYA_CACHE_DIR", t.TempDir())
+	src := fstest.MapFS{
+		"assets/llama/libllama.so.0.4.1":         {Data: []byte("stock")},
+		"assets/llama-deberta/libllama.so.0.5.0": {Data: []byte("patched")},
+		"assets/laya/tokenizer.json":             {Data: []byte("{}")},
+		"assets/gliner2-decide/tokenizer.json":   {Data: []byte("{}")},
+	}
+	// GLiNER runs on the patched libs, the others on the stock ones.
+	lib, _, err := extractAssets(src, "gliner2-decide")
+	if err != nil || filepath.Base(lib) != "llama-deberta" {
+		t.Fatalf("gliner libs: %s, %v", lib, err)
+	}
+	if _, err := os.Stat(filepath.Join(lib, "libllama.so.0")); err != nil {
+		t.Error("symlink missing in patched libs")
+	}
+	lib, _, err = extractAssets(src, "laya")
+	if err != nil || filepath.Base(lib) != "llama" {
+		t.Fatalf("laya libs: %s, %v", lib, err)
+	}
+	if got := embeddedModels(src); len(got) != 2 {
+		t.Errorf("lib dirs listed as models: %v", got)
+	}
+
+	// A downloadable model gets the stock libs and an (empty) dir under the cache root; no model files are extracted.
+	lib, dir, err := extractAssets(src, "qwen3guard")
+	if err != nil || filepath.Base(lib) != "llama" || filepath.Base(dir) != "qwen3guard" || filepath.Base(filepath.Dir(dir)) != "models" {
+		t.Fatalf("qwen3guard: lib %s dir %s err %v", lib, dir, err)
+	}
+	// The policy chat model is not a classifier.
+	if _, _, err := extractAssets(src, "policy"); err == nil {
+		t.Error("policy accepted as LAYA_MODEL")
+	}
+}

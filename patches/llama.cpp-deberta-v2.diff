@@ -1,0 +1,644 @@
+diff --git i/conversion/__init__.py w/conversion/__init__.py
+index 777b2f9..962498e 100644
+--- i/conversion/__init__.py
++++ w/conversion/__init__.py
+@@ -33,6 +33,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "BertForMaskedLM": "bert",
+     "BertForSequenceClassification": "bert",
+     "BertModel": "bert",
++    "DebertaV2Model": "bert",
++    "DebertaV2ForMaskedLM": "bert",
+     "BitnetForCausalLM": "bitnet",
+     "BitNetForCausalLM": "bitnet",
+     "BloomForCausalLM": "bloom",
+diff --git i/conversion/bert.py w/conversion/bert.py
+index 23d8b93..1f5eaee 100644
+--- i/conversion/bert.py
++++ w/conversion/bert.py
+@@ -464,6 +464,92 @@ class EuroBertModel(TextModel):
+         return super().filter_tensors((name, gen))
+ 
+ 
++@ModelBase.register("DebertaV2Model", "DebertaV2ForMaskedLM")
++class DebertaV2Model(TextModel):
++    """DeBERTa-v2/v3 encoder (also the encoder inside GLiNER2 checkpoints)."""
++    model_arch = gguf.MODEL_ARCH.DEBERTA_V2
++
++    def __init__(self, dir_model: Path, *args, **kwargs):
++        hparams = kwargs.pop("hparams", None)
++        if hparams is None:
++            hparams = ModelBase.load_hparams(dir_model, False)
++        # GLiNER checkpoints keep the encoder config in encoder_config/config.json
++        enc = dir_model / "encoder_config" / "config.json"
++        if enc.is_file():
++            with open(enc, "r", encoding="utf-8") as f:
++                hparams = {**hparams, **json.load(f)}
++        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        self.gguf_writer.add_causal_attention(False)
++        self.gguf_writer.add_layer_norm_eps(self.hparams.get("layer_norm_eps", 1e-7))
++
++        buckets = self.hparams.get("position_buckets") or 0
++        if buckets <= 0:
++            raise ValueError("deberta: position_buckets required")
++        self.gguf_writer.add_relative_attn_buckets_count(buckets)
++
++        max_pos = self.hparams.get("max_relative_positions")
++        if not isinstance(max_pos, int) or max_pos < 1:
++            max_pos = self.hparams["max_position_embeddings"]
++        self.gguf_writer.add_relative_attn_pos_max(max_pos)
++
++        assert self.hparams.get("share_att_key") and self.hparams.get("relative_attention")
++        assert set(self.hparams.get("pos_att_type", [])) == {"p2c", "c2p"}
++        assert not self.hparams.get("position_biased_input", True)
++        assert self.hparams.get("norm_rel_ebd") == "layer_norm"
++
++    def get_vocab_base_pre(self, tokenizer) -> str:
++        # Metaspace/Unigram, not byte-level BPE: the BPE pre-tokenizer hash table does not apply
++        return "default"
++
++    def set_vocab(self):
++        # DeBERTa-v3: Metaspace + Unigram tokenizer.json -> SPM-style vocab with scores
++        with open(self.dir_model / "tokenizer.json", "r", encoding="utf-8") as f:
++            tokjson = json.load(f)
++        if tokjson.get("model", {}).get("type") != "Unigram":
++            raise ValueError("deberta: expected Unigram tokenizer.json")
++        scores_by_piece = {p: float(sc) for p, sc in tokjson["model"]["vocab"]}
++
++        tokens, toktypes, tokpre = self.get_vocab_base()
++        scores = [scores_by_piece.get(t, 0.0) for t in tokens]
++
++        self.gguf_writer.add_tokenizer_model("llama")
++        self.gguf_writer.add_tokenizer_pre("default")
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_types(toktypes)
++        self.gguf_writer.add_token_scores(scores)
++        self.gguf_writer.add_token_type_count(self.hparams.get("type_vocab_size", 0) or 0)
++
++        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
++        special_vocab.add_to_gguf(self.gguf_writer)
++
++    @classmethod
++    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
++        name, gen = item
++
++        if name.startswith("deberta."):
++            name = name[8:]
++        # GLiNER wrapper: encoder.<hf encoder module names>
++        if name.startswith(("encoder.encoder.", "encoder.embeddings.")):
++            name = name[len("encoder."):]
++
++        if name.endswith(".gamma"):
++            name = name[:-6] + ".weight"
++        if name.endswith(".beta"):
++            name = name[:-5] + ".bias"
++
++        # no absolute positions / token types in v3; drop heads that are not the encoder
++        if name.startswith(("embeddings.position", "embeddings.token_type", "pooler.", "cls.", "lm_predictions.", "mask_predictions.")):
++            return None
++        # GLiNER2 task heads live in the same safetensors
++        if name.startswith(("classifier.", "count_embed.", "count_pred.", "span_rep.")):
++            return None
++
++        return super().filter_tensors((name, gen))
++
++
+ @ModelBase.register("XLMRobertaModel", "XLMRobertaForSequenceClassification")
+ @ModelBase.example("BAAI/bge-m3")
+ class XLMRobertaModel(BertModel):
+diff --git i/gguf-py/gguf/constants.py w/gguf-py/gguf/constants.py
+index 2daedfd..4b5903b 100644
+--- i/gguf-py/gguf/constants.py
++++ w/gguf-py/gguf/constants.py
+@@ -201,6 +201,7 @@ class Keys:
+         VALUE_RESIDUAL_MIX_LORA_RANK = "{arch}.attention.value_residual_mix_lora_rank"
+         GATE_LORA_RANK               = "{arch}.attention.gate_lora_rank"
+         REL_BUCKETS_COUNT            = "{arch}.attention.relative_buckets_count"
++        REL_POS_MAX                  = "{arch}.attention.relative_pos_max"
+         SLIDING_WINDOW               = "{arch}.attention.sliding_window"
+         SCALE                        = "{arch}.attention.scale"
+         OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
+@@ -516,6 +517,7 @@ class MODEL_ARCH(IntEnum):
+     JINA_BERT_V2     = auto()
+     JINA_BERT_V3     = auto()
+     EUROBERT         = auto()
++    DEBERTA_V2       = auto()
+     BLOOM            = auto()
+     STABLELM         = auto()
+     QWEN             = auto()
+@@ -870,6 +872,8 @@ class MODEL_TENSOR(IntEnum):
+     ENC_ATTN_V           = auto()
+     ENC_ATTN_OUT         = auto()
+     ENC_ATTN_REL_B       = auto()
++    REL_EMBD             = auto()
++    REL_EMBD_NORM        = auto()
+     ENC_FFN_NORM         = auto()
+     ENC_FFN_GATE         = auto()
+     ENC_FFN_DOWN         = auto()
+@@ -1277,6 +1281,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.JINA_BERT_V2:     "jina-bert-v2",
+     MODEL_ARCH.JINA_BERT_V3:     "jina-bert-v3",
+     MODEL_ARCH.EUROBERT:         "eurobert",
++    MODEL_ARCH.DEBERTA_V2:       "deberta-v2",
+     MODEL_ARCH.BLOOM:            "bloom",
+     MODEL_ARCH.STABLELM:         "stablelm",
+     MODEL_ARCH.QWEN:             "qwen",
+@@ -1630,6 +1635,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.ENC_ATTN_V:                "enc.blk.{bid}.attn_v",
+     MODEL_TENSOR.ENC_ATTN_OUT:              "enc.blk.{bid}.attn_o",
+     MODEL_TENSOR.ENC_ATTN_REL_B:            "enc.blk.{bid}.attn_rel_b",
++    MODEL_TENSOR.REL_EMBD:                  "rel_embd",
++    MODEL_TENSOR.REL_EMBD_NORM:             "rel_embd_norm",
+     MODEL_TENSOR.ENC_FFN_NORM:              "enc.blk.{bid}.ffn_norm",
+     MODEL_TENSOR.ENC_FFN_GATE:              "enc.blk.{bid}.ffn_gate",
+     MODEL_TENSOR.ENC_FFN_DOWN:              "enc.blk.{bid}.ffn_down",
+@@ -2565,6 +2572,20 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_UP,
+         MODEL_TENSOR.LAYER_OUT_NORM,
+     ],
++    MODEL_ARCH.DEBERTA_V2: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.TOKEN_EMBD_NORM,
++        MODEL_TENSOR.REL_EMBD,
++        MODEL_TENSOR.REL_EMBD_NORM,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_V,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.ATTN_OUT_NORM,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.FFN_DOWN,
++        MODEL_TENSOR.LAYER_OUT_NORM,
++    ],
+     MODEL_ARCH.EUROBERT: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+@@ -6023,6 +6044,7 @@ KEY_ATTENTION_HEAD_COUNT_KV     = Keys.Attention.HEAD_COUNT_KV
+ KEY_ATTENTION_MAX_ALIBI_BIAS    = Keys.Attention.MAX_ALIBI_BIAS
+ KEY_ATTENTION_CLAMP_KQV         = Keys.Attention.CLAMP_KQV
+ KEY_ATTENTION_LAYERNORM_EPS     = Keys.Attention.LAYERNORM_EPS
++KEY_ATTENTION_REL_POS_MAX       = Keys.Attention.REL_POS_MAX
+ KEY_ATTENTION_LAYERNORM_RMS_EPS = Keys.Attention.LAYERNORM_RMS_EPS
+ 
+ # RoPE
+diff --git i/gguf-py/gguf/gguf_writer.py w/gguf-py/gguf/gguf_writer.py
+index 342f6eb..c31f005 100644
+--- i/gguf-py/gguf/gguf_writer.py
++++ w/gguf-py/gguf/gguf_writer.py
+@@ -1025,6 +1025,9 @@ class GGUFWriter:
+     def add_relative_attn_buckets_count(self, value: int) -> None:
+         self.add_uint32(Keys.Attention.REL_BUCKETS_COUNT.format(arch=self.arch), value)
+ 
++    def add_relative_attn_pos_max(self, value: int) -> None:
++        self.add_uint32(Keys.Attention.REL_POS_MAX.format(arch=self.arch), value)
++
+     def add_sliding_window(self, value: int) -> None:
+         self.add_uint32(Keys.Attention.SLIDING_WINDOW.format(arch=self.arch), value)
+ 
+diff --git i/gguf-py/gguf/tensor_mapping.py w/gguf-py/gguf/tensor_mapping.py
+index 16df249..aa1eb5b 100644
+--- i/gguf-py/gguf/tensor_mapping.py
++++ w/gguf-py/gguf/tensor_mapping.py
+@@ -260,6 +260,7 @@ class TensorNameMap:
+             "model.layers.{bid}.self_attn.q_proj_no_perm",               # llama-custom
+             "layers.{bid}.attention.wq",                                 # llama-pth
+             "encoder.layer.{bid}.attention.self.query",                  # bert
++            "encoder.layer.{bid}.attention.self.query_proj",             # deberta-v2
+             "transformer.layer.{bid}.attention.q_lin",                   # distillbert
+             "transformer.h.{bid}.attn.q_proj",                           # gpt-j
+             "model.layers.layers.{bid}.self_attn.q_proj",                # plamo
+@@ -281,6 +282,7 @@ class TensorNameMap:
+             "model.layers.{bid}.self_attn.k_proj_no_perm",             # llama-custom
+             "layers.{bid}.attention.wk",                               # llama-pth
+             "encoder.layer.{bid}.attention.self.key",                  # bert
++            "encoder.layer.{bid}.attention.self.key_proj",             # deberta-v2
+             "transformer.layer.{bid}.attention.k_lin",                 # distillbert
+             "transformer.h.{bid}.attn.k_proj",                         # gpt-j
+             "transformer.h.{bid}.attn.k",                              # refact
+@@ -302,6 +304,7 @@ class TensorNameMap:
+             "layers.{bid}.self_attn.v_proj",                             # embeddinggemma
+             "layers.{bid}.attention.wv",                                 # llama-pth
+             "encoder.layer.{bid}.attention.self.value",                  # bert
++            "encoder.layer.{bid}.attention.self.value_proj",             # deberta-v2
+             "transformer.layer.{bid}.attention.v_lin",                   # distillbert
+             "transformer.h.{bid}.attn.v_proj",                           # gpt-j
+             "transformer.h.{bid}.attn.v",                                # refact
+@@ -1261,6 +1264,14 @@ class TensorNameMap:
+             "encoder.block.{bid}.layer.0.SelfAttention.o", # t5
+         ),
+ 
++        MODEL_TENSOR.REL_EMBD: (
++            "encoder.rel_embeddings",  # deberta-v2 (shared by all layers)
++        ),
++
++        MODEL_TENSOR.REL_EMBD_NORM: (
++            "encoder.LayerNorm",  # deberta-v2 (norm_rel_ebd)
++        ),
++
+         MODEL_TENSOR.ENC_ATTN_REL_B: (
+             "encoder.block.{bid}.layer.0.SelfAttention.relative_attention_bias", # t5
+         ),
+diff --git i/src/llama-arch.cpp w/src/llama-arch.cpp
+index 7ed8f8c..9e23f47 100644
+--- i/src/llama-arch.cpp
++++ w/src/llama-arch.cpp
+@@ -27,6 +27,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_JINA_BERT_V2,     "jina-bert-v2"     },
+     { LLM_ARCH_JINA_BERT_V3,     "jina-bert-v3"     },
+     { LLM_ARCH_EUROBERT,         "eurobert"         },
++    { LLM_ARCH_DEBERTA_V2,       "deberta-v2"       },
+     { LLM_ARCH_BLOOM,            "bloom"            },
+     { LLM_ARCH_STABLELM,         "stablelm"         },
+     { LLM_ARCH_QWEN,             "qwen"             },
+@@ -273,6 +274,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_ATTENTION_VALUE_RESIDUAL_MIX_LORA_RANK, "%s.attention.value_residual_mix_lora_rank" },
+     { LLM_KV_ATTENTION_GATE_LORA_RANK,               "%s.attention.gate_lora_rank"               },
+     { LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,       "%s.attention.relative_buckets_count"       },
++    { LLM_KV_ATTENTION_RELATIVE_POS_MAX,             "%s.attention.relative_pos_max"             },
+     { LLM_KV_ATTENTION_SLIDING_WINDOW,               "%s.attention.sliding_window"               },
+     { LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,       "%s.attention.sliding_window_pattern"       },
+     { LLM_KV_ATTENTION_ROPE_PATTERN,                 "%s.attention.rope_pattern"                 },
+@@ -616,6 +618,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_ENC_ATTN_V,                             "enc.blk.%d.attn_v" },
+     { LLM_TENSOR_ENC_ATTN_OUT,                           "enc.blk.%d.attn_o" },
+     { LLM_TENSOR_ENC_ATTN_REL_B,                         "enc.blk.%d.attn_rel_b" },
++    { LLM_TENSOR_REL_EMBD,                               "rel_embd" },
++    { LLM_TENSOR_REL_EMBD_NORM,                          "rel_embd_norm" },
+     { LLM_TENSOR_ENC_FFN_NORM,                           "enc.blk.%d.ffn_norm" },
+     { LLM_TENSOR_ENC_FFN_GATE,                           "enc.blk.%d.ffn_gate" },
+     { LLM_TENSOR_ENC_FFN_DOWN,                           "enc.blk.%d.ffn_down" },
+@@ -908,6 +912,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_ENC_FFN_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_DEC_ATTN_REL_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_ENC_ATTN_REL_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_REL_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_REL_EMBD_NORM,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+     {LLM_TENSOR_FFN_DOWN_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+     {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+     {LLM_TENSOR_FFN_UP_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+diff --git i/src/llama-arch.h w/src/llama-arch.h
+index 3b43784..b2bb86b 100644
+--- i/src/llama-arch.h
++++ w/src/llama-arch.h
+@@ -32,6 +32,7 @@ enum llm_arch {
+     LLM_ARCH_JINA_BERT_V2,
+     LLM_ARCH_JINA_BERT_V3,
+     LLM_ARCH_EUROBERT,
++    LLM_ARCH_DEBERTA_V2,
+     LLM_ARCH_BLOOM,
+     LLM_ARCH_STABLELM,
+     LLM_ARCH_QWEN,
+@@ -278,6 +279,7 @@ enum llm_kv {
+     LLM_KV_ATTENTION_VALUE_RESIDUAL_MIX_LORA_RANK,
+     LLM_KV_ATTENTION_GATE_LORA_RANK,
+     LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,
++    LLM_KV_ATTENTION_RELATIVE_POS_MAX,
+     LLM_KV_ATTENTION_SLIDING_WINDOW,
+     LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
+     LLM_KV_ATTENTION_SCALE,
+@@ -650,6 +652,8 @@ enum llm_tensor {
+     LLM_TENSOR_ENC_ATTN_V,
+     LLM_TENSOR_ENC_ATTN_OUT,
+     LLM_TENSOR_ENC_ATTN_REL_B,
++    LLM_TENSOR_REL_EMBD,
++    LLM_TENSOR_REL_EMBD_NORM,
+     LLM_TENSOR_ENC_FFN_NORM,
+     LLM_TENSOR_ENC_FFN_GATE,
+     LLM_TENSOR_ENC_FFN_DOWN,
+diff --git i/src/llama-graph.cpp w/src/llama-graph.cpp
+index 2df063f..d8e9088 100644
+--- i/src/llama-graph.cpp
++++ w/src/llama-graph.cpp
+@@ -190,6 +190,45 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
++// transformers make_log_bucket_position (deberta-v2), single signed distance
++static int32_t llama_deberta_log_bucket(int32_t rel, int32_t bucket_size, int32_t max_position) {
++    const int32_t mid = bucket_size / 2;
++    const int32_t a   = std::abs(rel);
++    const int32_t abs_pos = a < mid ? mid - 1 : a;
++    if (abs_pos <= mid) {
++        return rel;
++    }
++    // transformers computes this in float32
++    const float lp = std::ceil(std::log((float) abs_pos / (float) mid) /
++                               std::log((float) (max_position - 1) / (float) mid) * (float) (mid - 1));
++    const int32_t log_pos = (int32_t) lp + mid;
++    return rel < 0 ? -log_pos : log_pos;
++}
++
++void llm_graph_input_pos_bucket_deberta::set_input(const llama_ubatch * ubatch) {
++    if (!idx_c2p) {
++        return;
++    }
++    GGML_ASSERT(ggml_backend_buffer_is_host(idx_c2p->buffer));
++    GGML_ASSERT(ggml_backend_buffer_is_host(idx_p2c->buffer));
++
++    const int64_t n    = ubatch->n_tokens;
++    const int32_t span = (int32_t) hparams.n_rel_attn_bkts;
++    const int32_t top  = 2*span - 1;
++
++    int32_t * c2p = (int32_t *) idx_c2p->data;
++    int32_t * p2c = (int32_t *) idx_p2c->data;
++
++    for (int64_t i = 0; i < n; ++i) {         // query
++        for (int64_t j = 0; j < n; ++j) {     // key
++            int32_t b = llama_deberta_log_bucket(ubatch->pos[i] - ubatch->pos[j], span, (int32_t) hparams.n_rel_pos_max) + span;
++            b = b < 0 ? 0 : (b > top ? top : b);
++            c2p[i*n + j] = b; // ne0 = j
++            p2c[j*n + i] = b; // ne0 = i
++        }
++    }
++}
++
+ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
+     if (pos_bucket) {
+         mctx->set_input_pos_bucket(pos_bucket, ubatch);
+diff --git i/src/llama-graph.h w/src/llama-graph.h
+index 3daa425..4e4d36c 100644
+--- i/src/llama-graph.h
++++ w/src/llama-graph.h
+@@ -199,6 +199,24 @@ public:
+     const llama_hparams hparams;
+ };
+ 
++// DeBERTa-v2 disentangled attention: relative-position index grids, host-filled.
++//   idx(i, j) = clamp(log_bucket(pos_i - pos_j) + att_span, 0, 2*att_span - 1), i = query, j = key.
++// Two layouts of the same grid, one per gather (see models/deberta-v2.cpp):
++//   idx_c2p [n_tokens(j), n_tokens(i)]   (ne0 = key)
++//   idx_p2c [n_tokens(i), n_tokens(j)]   (ne0 = query)
++class llm_graph_input_pos_bucket_deberta : public llm_graph_input_i {
++public:
++    llm_graph_input_pos_bucket_deberta(const llama_hparams & hparams) : hparams(hparams) {}
++    virtual ~llm_graph_input_pos_bucket_deberta() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    ggml_tensor * idx_c2p = nullptr; // I32
++    ggml_tensor * idx_p2c = nullptr; // I32
++
++    const llama_hparams hparams;
++};
++
+ class llm_graph_input_pos_bucket_kv : public llm_graph_input_i {
+ public:
+     llm_graph_input_pos_bucket_kv(
+diff --git i/src/llama-hparams.h w/src/llama-hparams.h
+index 8248add..3832890 100644
+--- i/src/llama-hparams.h
++++ w/src/llama-hparams.h
+@@ -71,6 +71,7 @@ struct llama_hparams {
+     int32_t  router_layer = -1;
+     uint32_t n_expert = 0;
+     uint32_t n_rel_attn_bkts = 0;
++    uint32_t n_rel_pos_max   = 0; // deberta max_relative_positions
+ 
+     // TODO: this needs to be reworked
+     int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
+diff --git i/src/llama-model.cpp w/src/llama-model.cpp
+index eff60ee..e426445 100644
+--- i/src/llama-model.cpp
++++ w/src/llama-model.cpp
+@@ -82,6 +82,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_neo_bert(params);
+         case LLM_ARCH_EUROBERT:
+             return new llama_model_eurobert(params);
++        case LLM_ARCH_DEBERTA_V2:
++            return new llama_model_deberta_v2(params);
+         case LLM_ARCH_BLOOM:
+             return new llama_model_bloom(params);
+         case LLM_ARCH_MPT:
+@@ -2362,6 +2364,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+         case LLM_ARCH_NOMIC_BERT_MOE:
+         case LLM_ARCH_NEO_BERT:
+         case LLM_ARCH_EUROBERT:
++        case LLM_ARCH_DEBERTA_V2:
+         case LLM_ARCH_WAVTOKENIZER_DEC:
+         case LLM_ARCH_MODERN_BERT:
+         case LLM_ARCH_GEMMA_EMBEDDING:
+@@ -3111,6 +3114,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_NOMIC_BERT:
+         case LLM_ARCH_NOMIC_BERT_MOE:
+         case LLM_ARCH_EUROBERT:
++        case LLM_ARCH_DEBERTA_V2:
+         case LLM_ARCH_STABLELM:
+         case LLM_ARCH_BITNET:
+         case LLM_ARCH_QWEN:
+diff --git i/src/llama-model.h w/src/llama-model.h
+index 8c4e438..cf76e02 100644
+--- i/src/llama-model.h
++++ w/src/llama-model.h
+@@ -656,6 +656,11 @@ struct llama_model {
+     struct ggml_tensor * output_b        = nullptr;
+     struct ggml_tensor * output_norm_enc = nullptr;
+ 
++    // deberta-v2 shared relative-position embedding (+ its LayerNorm)
++    struct ggml_tensor * rel_embd        = nullptr;
++    struct ggml_tensor * rel_embd_norm   = nullptr;
++    struct ggml_tensor * rel_embd_norm_b = nullptr;
++
+ 
+     // NVFP4 per-tensor scale2, input_scale for LM head
+     struct ggml_tensor * output_s    = nullptr;
+diff --git i/src/models/deberta-v2.cpp w/src/models/deberta-v2.cpp
+new file mode 100644
+index 0000000..b8ff8e1
+--- /dev/null
++++ w/src/models/deberta-v2.cpp
+@@ -0,0 +1,169 @@
++// DeBERTa-v2/v3 encoder: disentangled attention (content-to-position + position-to-content)
++// over one relative-position embedding shared by all layers (share_att_key: the position
++// stream reuses each layer's q/k projections).
++//
++//   score[h,i,j] = ( q_i.k_j  +  q_i.posk[idx(i,j)]  +  k_j.posq[idx(i,j)] ) / sqrt(3*d_head)
++//   idx(i,j)     = clamp(log_bucket(pos_i - pos_j) + span, 0, 2*span-1)
++//
++// Post-LN blocks, no RoPE, no absolute positions (position_biased_input=false), no final norm
++// (encoder.LayerNorm only normalises the relative embedding).
++
++#include "models.h"
++
++void llama_model_deberta_v2::load_arch_hparams(llama_model_loader & ml) {
++    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,          hparams.f_norm_eps);
++    ml.get_key(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, hparams.n_rel_attn_bkts); // position_buckets
++    ml.get_key(LLM_KV_ATTENTION_RELATIVE_POS_MAX,       hparams.n_rel_pos_max);   // max_relative_positions
++
++    if (hparams.n_rel_attn_bkts == 0 || hparams.n_rel_pos_max == 0) {
++        throw std::runtime_error("deberta-v2: relative_buckets_count and relative_pos_max must be set");
++    }
++
++    switch (hparams.n_layer()) {
++        case 12: type = LLM_TYPE_137M; break;
++        case 24: type = LLM_TYPE_410M; break; // deberta-v3-large
++        default: type = LLM_TYPE_UNKNOWN;
++    }
++}
++
++void llama_model_deberta_v2::load_arch_tensors(llama_model_loader &) {
++    LLAMA_LOAD_LOCALS;
++
++    tok_embd   = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    tok_norm   = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight", 0), {n_embd}, 0);
++    tok_norm_b = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM, "bias",   0), {n_embd}, 0);
++
++    rel_embd        = create_tensor(tn(LLM_TENSOR_REL_EMBD, "weight"), {n_embd, 2*(int64_t) hparams.n_rel_attn_bkts}, 0);
++    rel_embd_norm   = create_tensor(tn(LLM_TENSOR_REL_EMBD_NORM, "weight"), {n_embd}, 0);
++    rel_embd_norm_b = create_tensor(tn(LLM_TENSOR_REL_EMBD_NORM, "bias"),   {n_embd}, 0);
++
++    for (int i = 0; i < n_layer; ++i) {
++        auto & layer = layers[i];
++
++        create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
++
++        layer.wo   = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
++        layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias",   i), {n_embd}, 0);
++
++        layer.attn_out_norm   = create_tensor(tn(LLM_TENSOR_ATTN_OUT_NORM, "weight", i), {n_embd}, 0);
++        layer.attn_out_norm_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT_NORM, "bias",   i), {n_embd}, 0);
++
++        layer.ffn_up     = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
++        layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias",   i), {n_ff}, 0);
++        layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
++        layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias",   i), {n_embd}, 0);
++
++        layer.layer_out_norm   = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM, "weight", i), {n_embd}, 0);
++        layer.layer_out_norm_b = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM, "bias",   i), {n_embd}, 0);
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_deberta_v2::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(*this, params);
++}
++
++// pos [d_head, n_rows, n_head] . x [d_head, n_tok, n_head]  ->  [n_head, n_rows, n_tok]
++// (head innermost so that get_rows can gather whole per-head vectors by relative bucket)
++static ggml_tensor * deberta_pos_scores(ggml_context * ctx, ggml_tensor * pos_h, ggml_tensor * x_h) {
++    ggml_tensor * s = ggml_mul_mat(ctx, pos_h, x_h);                        // [rows, n_tok, n_head]
++    return ggml_cont(ctx, ggml_permute(ctx, s, 1, 2, 0, 3));                // [n_head, rows, n_tok]
++}
++
++llama_model_deberta_v2::graph::graph(const llama_model & model, const llm_graph_params & params)
++        : llm_graph_context(params) {
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++    const int64_t n_rows      = 2*(int64_t) hparams.n_rel_attn_bkts;
++
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++    GGML_ASSERT(model.rel_embd);
++
++    auto inp_rel = std::make_unique<llm_graph_input_pos_bucket_deberta>(hparams);
++    inp_rel->idx_c2p = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_tokens);
++    inp_rel->idx_p2c = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_tokens);
++    ggml_set_input(inp_rel->idx_c2p);
++    ggml_set_input(inp_rel->idx_p2c);
++    ggml_tensor * idx_c2p = inp_rel->idx_c2p;
++    ggml_tensor * idx_p2c = inp_rel->idx_p2c;
++    res->add_input(std::move(inp_rel));
++
++    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
++    inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
++    cb(inpL, "inp_norm", 0);
++
++    // norm_rel_ebd == layer_norm; the CUDA/CPU norm wants F32
++    ggml_tensor * rel_src = model.rel_embd;
++    if (rel_src->type != GGML_TYPE_F32) {
++        rel_src = ggml_cast(ctx0, rel_src, GGML_TYPE_F32);
++    }
++    ggml_tensor * rel_e = build_norm(rel_src, model.rel_embd_norm, model.rel_embd_norm_b, LLM_NORM, -1);
++    cb(rel_e, "rel_e", -1);
++
++    auto * inp_attn = build_attn_inp_no_cache();
++
++    // all three score terms share sqrt(d_head * (1 + #pos_att_types)) with pos_att_type = [p2c, c2p]
++    const float kq_scale = 1.0f / sqrtf(3.0f * (float) n_embd_head);
++
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & L = model.layers[il];
++
++        auto [Qcur, Kcur, Vcur] = build_qkv(L, inpL, n_embd_head, n_head, n_head_kv, il);
++
++        // share_att_key: position stream goes through the layer's own q/k projections
++        ggml_tensor * pos_q = ggml_mul_mat(ctx0, L.wq, rel_e);
++        ggml_tensor * pos_k = ggml_mul_mat(ctx0, L.wk, rel_e);
++        if (L.wq_b) { pos_q = ggml_add(ctx0, pos_q, L.wq_b); }
++        if (L.wk_b) { pos_k = ggml_add(ctx0, pos_k, L.wk_b); }
++
++        // [n_embd, rows] -> [d_head, rows, n_head]
++        pos_q = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, pos_q, n_embd_head, n_head, n_rows), 0, 2, 1, 3));
++        pos_k = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, pos_k, n_embd_head, n_head, n_rows), 0, 2, 1, 3));
++
++        // [d_head, n_head, n_tok] -> [d_head, n_tok, n_head]
++        ggml_tensor * q_h = ggml_cont(ctx0, ggml_permute(ctx0, Qcur, 0, 2, 1, 3));
++        ggml_tensor * k_h = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
++
++        // kq layout in build_attn_mha is [n_kv(key j), n_tokens(query i), n_head].
++        //
++        // c2p[j,i,h] = q_i . posk[idx(i,j)]
++        ggml_tensor * c2p = deberta_pos_scores(ctx0, pos_k, q_h);                     // [n_head, rows, i]
++        c2p = ggml_get_rows(ctx0, c2p, idx_c2p);                                      // [n_head, j, i]
++        c2p = ggml_cont(ctx0, ggml_permute(ctx0, c2p, 2, 0, 1, 3));                   // [j, i, n_head]
++        cb(c2p, "rel_c2p", il);
++
++        // p2c[j,i,h] = k_j . posq[idx(i,j)]
++        ggml_tensor * p2c = deberta_pos_scores(ctx0, pos_q, k_h);                     // [n_head, rows, j]
++        p2c = ggml_get_rows(ctx0, p2c, idx_p2c);                                      // [n_head, i, j]
++        p2c = ggml_cont(ctx0, ggml_permute(ctx0, p2c, 2, 1, 0, 3));                   // [j, i, n_head]
++        cb(p2c, "rel_p2c", il);
++
++        ggml_tensor * kq_b = ggml_add(ctx0, c2p, p2c); // raw; build_attn applies kq_scale to (qk + kq_b)
++
++        ggml_tensor * cur = build_attn(inp_attn, L.wo, L.wo_b, L.wo_s,
++                Qcur, Kcur, Vcur, kq_b, nullptr, nullptr, kq_scale, il);
++        cb(cur, "kqv_out", il);
++
++        // post-LN
++        cur = ggml_add(ctx0, cur, inpL);
++        cur = build_norm(cur, L.attn_out_norm, L.attn_out_norm_b, LLM_NORM, il);
++        cb(cur, "attn_out_norm", il);
++
++        ggml_tensor * ffn_inp = cur;
++
++        // exact (erf) GELU, as in transformers hidden_act="gelu"
++        cur = ggml_add(ctx0, ggml_mul_mat(ctx0, L.ffn_up, cur), L.ffn_up_b);
++        cur = ggml_gelu_erf(ctx0, cur);
++        cur = ggml_add(ctx0, ggml_mul_mat(ctx0, L.ffn_down, cur), L.ffn_down_b);
++        cb(cur, "ffn_out", il);
++
++        cur = ggml_add(ctx0, cur, ffn_inp);
++        cur = build_norm(cur, L.layer_out_norm, L.layer_out_norm_b, LLM_NORM, il);
++        cb(cur, "ffn_out_norm", il);
++
++        inpL = cur;
++    }
++
++    // no final norm: DebertaV2Encoder returns the last layer output as is
++    cb(inpL, "result_embd", -1);
++    res->t_embd = inpL;
++    ggml_build_forward_expand(gf, inpL);
++}
+diff --git i/src/models/models.h w/src/models/models.h
+index 0e7d59a..80ea859 100644
+--- i/src/models/models.h
++++ w/src/models/models.h
+@@ -357,6 +357,19 @@ struct llama_model_modern_bert : public llama_model_base {
+ };
+ 
+ 
++struct llama_model_deberta_v2 : public llama_model_base {
++    llama_model_deberta_v2(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++
+ struct llama_model_neo_bert : public llama_model_base {
+     llama_model_neo_bert(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
