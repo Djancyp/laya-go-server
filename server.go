@@ -23,11 +23,36 @@ type predictor interface {
 	Predict(state string, qs []laya.Question) ([]laya.Result, error)
 }
 
+// moderator is implemented by moderation models (Qwen3Guard): a full assessment with categories
+// and, for a response, the refusal flag.
+type moderator interface {
+	Moderate(prompt, response string) (laya.Moderation, error)
+	// Answer answers questions from a prompt moderation, saving a second pass over the prompt.
+	Answer(m laya.Moderation, qs []laya.Question) ([]laya.Result, error)
+}
+
+type policyHolder struct{ c policyCompiler }
+
+func (s *server) setPolicy(c policyCompiler) {
+	if c == nil {
+		s.policyC.Store(nil)
+		return
+	}
+	s.policyC.Store(&policyHolder{c})
+}
+
 type server struct {
-	model   predictor
-	log     *slog.Logger
-	limits  limits
-	timeout time.Duration
+	model predictor
+	// policyC compiles policy text into questions; nil until the policy model is loaded.
+	policyC       atomic.Pointer[policyHolder]
+	policyLoading atomic.Bool // the policy model is being downloaded or loaded
+	// policySem admits at most cap(policySem) /v1/policy requests: a compile takes seconds on the
+	// compiler's single context, and must not use up the slots of /v1/systemone (sem).
+	policySem     chan struct{}
+	policyTimeout time.Duration
+	log           *slog.Logger
+	limits        limits
+	timeout       time.Duration
 	// sem admits at most cap(sem) requests, running or queued: the encoder runs one
 	// sequence at a time, so a deeper queue only adds latency.
 	sem   chan struct{}
@@ -49,6 +74,7 @@ func (s *server) handler() http.Handler {
 		}
 	})
 	mux.Handle("POST /v1/systemone", s.auth(http.HandlerFunc(s.systemOne)))
+	mux.Handle("POST /v1/policy", s.auth(http.HandlerFunc(s.policy)))
 	return s.recoverer(s.logged(mux))
 }
 
@@ -64,7 +90,16 @@ func (s *server) systemOne(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	state, qs, err := req.parse(s.limits)
+	mod, _ := s.model.(moderator)
+	state, qs, err := req.parse(s.limits, mod != nil)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_request", err.Error())
+		return
+	}
+	response, err := req.responseText(s.limits)
+	if err == nil && response != "" && mod == nil {
+		err = errors.New("response is only supported by moderation models")
+	}
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_request", err.Error())
 		return
@@ -83,6 +118,7 @@ func (s *server) systemOne(w http.ResponseWriter, r *http.Request) {
 
 	type outcome struct {
 		rs  []laya.Result
+		mod *laya.Moderation
 		err error
 	}
 	done := make(chan outcome, 1)
@@ -94,11 +130,22 @@ func (s *server) systemOne(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
 				s.log.Error("panic in predict", "value", v)
-				done <- outcome{nil, fmt.Errorf("panic: %v", v)}
+				done <- outcome{err: fmt.Errorf("panic: %v", v)}
 			}
 		}()
-		rs, err := s.model.Predict(state, qs)
-		done <- outcome{rs, err}
+		var o outcome
+		if mod != nil {
+			m, err := mod.Moderate(state, response)
+			o.mod, o.err = &m, err
+		}
+		if o.err == nil && len(qs) > 0 {
+			if mod != nil && response == "" {
+				o.rs, o.err = mod.Answer(*o.mod, qs)
+			} else {
+				o.rs, o.err = s.model.Predict(state, qs)
+			}
+		}
+		done <- o
 	}()
 
 	select {
@@ -116,7 +163,17 @@ func (s *server) systemOne(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, "internal", "prediction failed")
 				break
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"model": modelName, "answers": answers, "usage": u})
+			body := map[string]any{"model": modelName, "answers": answers, "usage": u}
+			if o.mod != nil {
+				body["moderation"] = o.mod
+				if response == "" {
+					u.InputTokens = o.mod.Tokens // the questions reuse the moderation's pass
+				} else {
+					u.InputTokens += o.mod.Tokens
+				}
+				body["usage"] = u
+			}
+			writeJSON(w, http.StatusOK, body)
 		}
 	case <-ctx.Done():
 		writeError(w, http.StatusGatewayTimeout, "timeout", "request timed out")

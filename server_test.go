@@ -53,11 +53,13 @@ func (f *fakeModel) Predict(state string, qs []laya.Question) ([]laya.Result, er
 
 func newTestServer(m predictor, keys ...string) *server {
 	s := &server{
-		model:   m,
-		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		limits:  limits{MaxQuestions: 4, MaxStateBytes: 100, MaxInstructions: 100},
-		timeout: time.Second,
-		sem:     make(chan struct{}, 2),
+		model:         m,
+		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		limits:        limits{MaxQuestions: 4, MaxStateBytes: 100, MaxInstructions: 100},
+		timeout:       time.Second,
+		sem:           make(chan struct{}, 2),
+		policySem:     make(chan struct{}, 2),
+		policyTimeout: time.Second,
 	}
 	for _, k := range keys {
 		s.keys = append(s.keys, sha256.Sum256([]byte(k)))

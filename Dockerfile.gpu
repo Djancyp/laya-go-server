@@ -28,11 +28,16 @@ RUN mkdir -p assets/llama-cuda && cd /tmp/llama-libs && for f in lib*.so*; do [ 
 RUN CGO_ENABLED=0 GOEXPERIMENT=simd go build -tags cuda -trimpath -ldflags="-s -w" -o /laya-server .
 
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+# ca-certificates: without it the image has no root CA pool at all, so every
+# outbound HTTPS call fails "x509: certificate signed by unknown authority" —
+# including POST /v1/policy's first-use download of its chat model from
+# Hugging Face.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 laya && mkdir /var/cache/laya && chown laya /var/cache/laya
 COPY --from=build /laya-server /usr/local/bin/laya-server
 USER laya
+# gliner2-decide needs a patched llama.cpp that this CUDA build does not have, so the GPU image defaults to laya-guard.
 ARG DEFAULT_MODEL=laya-guard
 ENV LAYA_MODEL=$DEFAULT_MODEL LAYA_CACHE_DIR=/var/cache/laya LAYA_ADDR=:8080 LAYA_GPU_LAYERS=99 NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EXPOSE 8080

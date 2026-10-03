@@ -1,2 +1,6 @@
 .git
 laya-server
+# air build dir (holds a ~2 GB binary) and test/profile output
+tmp/
+*.test
+*.prof
